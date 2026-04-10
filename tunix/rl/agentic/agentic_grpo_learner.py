@@ -466,6 +466,15 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
           rewards=rewards, num_generations=self.algo_config.num_generations
       )
 
+    logging.debug("Advantages computed: %s", advantages)
+
+    if self.algo_config.degenerate_group_masking:
+      if jnp.all(jnp.isclose(advantages, 0.0)):
+        logging.info(
+            "Filtering degenerate group %s with all-0 advantages.", group_id
+        )
+        completion_mask = jnp.zeros_like(completion_mask)
+
     policy_versions = np.array(policy_versions_list, dtype=np.int32)
 
     # Log completion lengths, rewards and env time.
@@ -526,7 +535,6 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
           user_defined_metric, mode=mode, step=expected_step
       )
 
-    logging.debug("Advantages computed: %s", advantages)
     combined_batch = TrainExample(
         prompt_ids=prompt_ids,
         prompt_mask=prompt_mask,
@@ -607,19 +615,6 @@ def grpo_loss_fn(
         f" {advantages.shape}"
     )
 
-  # Mask out degenerate groups (all-0 sequence advantages).
-  # For group-relative advantages, all-0 indicates a no-signal group (e.g. all
-  # rewards are equal). Such groups should not contribute to policy, KL, or
-  # entropy terms in this loss.
-  if algo_config.degenerate_group_masking:
-    num_generations = algo_config.num_generations
-    grouped_advantages = advantages.reshape((-1, num_generations))
-    invalid_group = jnp.all(jnp.isclose(grouped_advantages, 0.0), axis=-1)
-    valid_group_mask = jnp.logical_not(invalid_group)
-    valid_sequence_mask = jnp.repeat(valid_group_mask, num_generations)[:, None]
-    completion_mask = completion_mask * valid_sequence_mask.astype(
-        completion_mask.dtype
-    )
 
   if train_example.old_per_token_logps is None:
     old_per_token_logps = jax.lax.stop_gradient(per_token_logps)
@@ -734,6 +729,35 @@ def compute_advantages(rewards: jax.Array, num_generations: int) -> jax.Array:
   mean_grouped_rewards = mean_grouped_rewards.repeat(num_generations)
   std_grouped_rewards = std_grouped_rewards.repeat(num_generations)
   return (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-6)
+
+
+@function_registry.register_advantage_estimator("agentic_rloo")
+def compute_rloo_advantages(
+    rewards: jax.Array, num_generations: int
+) -> jax.Array:
+  """Compute RLOO (REINFORCE Leave-One-Out) advantages.
+
+  RLOO computes a baseline for each completion by averaging the rewards of all
+  other completions to the same prompt.
+
+  Args:
+    rewards: reward functions output.
+    num_generations: Number of generations.
+
+  Returns:
+    RLOO advantages.
+  """
+  if num_generations < 2:
+    # RLOO requires at least 2 samples to calculate a baseline.
+    return jnp.zeros_like(rewards)
+
+  reshaped_rewards = rewards.reshape(-1, num_generations)
+  loo_mean = (
+      reshaped_rewards.sum(axis=-1, keepdims=True) - reshaped_rewards
+  ) / (num_generations - 1)
+  rloo_advantages = reshaped_rewards - loo_mean
+
+  return rloo_advantages.flatten()
 
 
 GrpoConfig = GRPOConfig
